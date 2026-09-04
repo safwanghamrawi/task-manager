@@ -22,6 +22,18 @@ next-env.d.ts
 *.tsbuildinfo
 npm-debug.log*
 
+# Terraform. The lock file IS committed — it pins provider versions the same
+# way package-lock.json pins npm ones. State is not: it contains the generated
+# database password in cleartext.
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+# Real variable values, as opposed to terraform.tfvars.example.
+*.auto.tfvars
+terraform.tfvars
+
 # Local tooling
 .DS_Store
 .idea/
