@@ -1,0 +1,91 @@
+################################################################################
+# Traefik static configuration - HTTP only (default).
+#
+# Traefik's static configuration sources are mutually exclusive, so everything
+# static lives here and the TLS deployment swaps in traefik.tls.yml instead of
+# layering CLI flags on top. Routing itself is dynamic and comes from the
+# container labels in docker-compose.yml plus the files in ./dynamic.
+################################################################################
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+  format: json
+
+accessLog:
+  format: json
+  # Health and metrics traffic would otherwise dominate the access log.
+  filters:
+    statusCodes:
+      - "200-299"
+      - "400-599"
+  fields:
+    headers:
+      defaultMode: drop
+      names:
+        User-Agent: keep
+        X-Request-ID: keep
+
+api:
+  # The dashboard is not exposed. There is no router for it and `insecure` is
+  # off, so nothing serves it on any entrypoint.
+  dashboard: false
+  insecure: false
+
+ping:
+  entryPoint: ping
+
+entryPoints:
+  web:
+    address: ":80"
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+    forwardedHeaders:
+      # Only trust X-Forwarded-* from the loopback/private ranges. On EC2 this
+      # matters the moment an ALB or CloudFront sits in front.
+      trustedIPs:
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+
+  # Internal-only entrypoints: not published to the host in docker-compose.yml,
+  # so they are reachable from the compose network and nowhere else.
+  metrics:
+    address: ":8082"
+  ping:
+    address: ":8083"
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+    buckets:
+      - 0.05
+      - 0.1
+      - 0.25
+      - 0.5
+      - 1.0
+      - 2.5
+      - 5.0
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    # Nothing is routed unless a container explicitly opts in with
+    # traefik.enable=true. A compromised or careless container cannot publish
+    # itself to the internet by accident.
+    exposedByDefault: false
+    network: edge
+    watch: true
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

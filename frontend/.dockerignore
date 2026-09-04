@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+npm-debug.log*
+.env
+.env.*
+!.env.example
+*.md
+.git/
+.github/
+coverage/

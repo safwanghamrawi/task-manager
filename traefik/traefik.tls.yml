@@ -1,0 +1,95 @@
+################################################################################
+# Traefik static configuration - HTTPS with Let's Encrypt.
+#
+# Used by docker-compose.tls.yml, which mounts this file over
+# /etc/traefik/traefik.yml. Requires a real DNS name pointing at the instance
+# and port 443 open in the security group.
+################################################################################
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+  format: json
+
+accessLog:
+  format: json
+  filters:
+    statusCodes:
+      - "200-299"
+      - "400-599"
+  fields:
+    headers:
+      defaultMode: drop
+      names:
+        User-Agent: keep
+        X-Request-ID: keep
+
+api:
+  dashboard: false
+  insecure: false
+
+ping:
+  entryPoint: ping
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      # Plain HTTP exists only to answer the ACME challenge and to redirect.
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        certResolver: letsencrypt
+      middlewares:
+        - security-headers@file
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+    forwardedHeaders:
+      trustedIPs:
+        - "127.0.0.1/32"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+
+  metrics:
+    address: ":8082"
+  ping:
+    address: ":8083"
+
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "${ACME_EMAIL}"
+      storage: /letsencrypt/acme.json
+      httpChallenge:
+        entryPoint: web
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: edge
+    watch: true
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true

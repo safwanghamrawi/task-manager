@@ -1,0 +1,49 @@
+# Alerting rules. Deliberately few and symptom-based: each one corresponds to
+# something a user would actually notice.
+
+groups:
+  - name: task-manager-availability
+    rules:
+      - alert: BackendDown
+        expr: up{job="task-manager-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend instance is not being scraped"
+          description: "{{ $labels.instance }} has been unreachable for over a minute."
+
+      - alert: DatabaseUnreachable
+        expr: database_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend cannot reach PostgreSQL"
+          description: "The health probe on {{ $labels.instance }} has failed for 2 minutes."
+
+  - name: task-manager-latency-errors
+    rules:
+      - alert: HighServerErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of requests are failing"
+          description: "5xx rate has exceeded 5% of all traffic for 5 minutes."
+
+      - alert: HighRequestLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, path) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 latency above 1s on {{ $labels.path }}"
+          description: "Investigate database contention or an undersized instance."

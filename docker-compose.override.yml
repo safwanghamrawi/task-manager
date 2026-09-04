@@ -1,0 +1,56 @@
+################################################################################
+# Local development overrides.
+#
+# Compose loads this automatically on top of docker-compose.yml
+################################################################################
+
+services:
+  traefik:
+    ports:
+      - "${HTTP_PORT:-80}:80"
+
+  postgres:
+    ports:
+      # Exposed for psql and for pointing the test-suite at real Postgres.
+      # Bound to loopback so it is never reachable off the machine.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+
+  backend:
+    image: task-manager-backend:dev
+    build:
+      context: ./backend
+      target: dev
+    environment:
+      ENVIRONMENT: local
+      LOG_LEVEL: DEBUG
+      DB_ECHO: "false"
+      CORS_ORIGINS: "http://localhost:3000,http://127.0.0.1:3000"
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend/app:/app/app:ro
+      - ./backend/tests:/app/tests:ro
+    # The reloader needs to write its own state; drop the hardening that would
+    # get in its way. Production keeps all of it.
+    read_only: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health/live')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  frontend:
+    image: task-manager-frontend:dev
+    build:
+      context: ./frontend
+      target: dev
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+    read_only: false

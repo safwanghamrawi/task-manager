@@ -1,0 +1,35 @@
+# Prometheus scrape configuration for the single-instance deployment.
+# Targets are resolved over the compose `edge` network, so no metrics endpoint
+# has to be published to the internet.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    environment: "production"
+    instance_role: "task-manager-ec2"
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: task-manager-backend
+    metrics_path: /metrics
+    # `tasks.backend` would be the Swarm form; on plain compose, DNS round
+    # robin over the service name returns every replica, and dns_sd keeps the
+    # target list correct after `--scale backend=N`.
+    dns_sd_configs:
+      - names: ["backend"]
+        type: A
+        port: 8000
+        refresh_interval: 30s
+
+  - job_name: traefik
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["traefik:8082"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

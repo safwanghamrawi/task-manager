@@ -1,0 +1,9 @@
+.git/
+.github/
+node_modules/
+.next/
+**/__pycache__/
+.env
+.env.*
+!.env.example
+loadtest/results/

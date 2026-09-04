@@ -1,0 +1,238 @@
+################################################################################
+# All Docker services
+#   docker compose up -d                      # run the published images
+#   docker compose --profile monitoring up -d # add Prometheus
+#   docker compose up -d --scale backend=3    # more backend replicas
+#
+################################################################################
+
+name: taskmanager
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  restart: unless-stopped
+
+services:
+  ############################################################################
+  # Edge router. The only container publishing ports to the host.
+  ############################################################################
+  traefik:
+    image: traefik:v3.7
+    <<: *default-restart
+    logging: *default-logging
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    networks:
+      - edge
+    volumes:
+      # Read-only socket: Traefik must watch container events, but it has no
+      # business creating or killing containers.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    labels:
+      - "traefik.enable=false"
+
+  ############################################################################
+  # Database. Never published to the host; only reachable on the internal
+  # network, which the edge router is not attached to.
+  ############################################################################
+  postgres:
+    image: postgres:17-alpine
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-tasks}
+      # Faster, still crash-safe checksummed initialisation.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - internal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -U/-d make this a real check against the application database rather
+      # than the default `postgres` one.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-tasks} -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    # Give Postgres time to finish a checkpoint on shutdown instead of being
+    # SIGKILLed into recovery on next boot.
+    stop_grace_period: 30s
+    shm_size: 256mb
+    labels:
+      - "traefik.enable=false"
+
+  ############################################################################
+  # API. Stateless: every replica is interchangeable, so `--scale backend=N`
+  # is all that horizontal scaling requires on this host.
+  ############################################################################
+  backend:
+    image: ${DOCKERHUB_NAMESPACE:?DOCKERHUB_NAMESPACE is required}/${BACKEND_IMAGE_NAME:-task-manager-backend}:${IMAGE_TAG:-latest}
+    build:
+      context: ./backend
+      target: runtime
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tasks}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-5}
+      DB_AUTO_CREATE_SCHEMA: ${DB_AUTO_CREATE_SCHEMA:-true}
+      MAX_TASKS: ${MAX_TASKS:-10000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    networks:
+      - edge      # reachable by Traefik
+      - internal  # reachable to Postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    # Longer than uvicorn's 20s graceful shutdown, so draining always wins the
+    # race against SIGKILL.
+    stop_grace_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+
+      # --- Public API -----------------------------------------------------
+      # Priority beats the frontend's catch-all rule.
+      - "traefik.http.routers.backend.rule=${BACKEND_ROUTE_RULE:-PathPrefix(`/api`)}"
+      - "traefik.http.routers.backend.entrypoints=web"
+      - "traefik.http.routers.backend.priority=100"
+      # Per-client rate limit. Defined here rather than in the file provider
+      # so the thresholds are environment-tunable; sized well above one
+      # client's realistic share but below what saturates a single replica.
+      - "traefik.http.middlewares.api-rate-limit.ratelimit.average=${API_RATE_LIMIT_AVERAGE:-200}"
+      - "traefik.http.middlewares.api-rate-limit.ratelimit.burst=${API_RATE_LIMIT_BURST:-400}"
+      - "traefik.http.middlewares.api-rate-limit.ratelimit.period=1s"
+      - "traefik.http.routers.backend.middlewares=security-headers@file,api-rate-limit,backend-retry@file"
+      - "traefik.http.routers.backend.service=backend"
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+
+      # Traefik stops routing to a replica whose readiness check fails, which
+      # is what makes `--scale` and rolling restarts safe.
+      - "traefik.http.services.backend.loadbalancer.healthcheck.path=/health/ready"
+      - "traefik.http.services.backend.loadbalancer.healthcheck.interval=10s"
+      - "traefik.http.services.backend.loadbalancer.healthcheck.timeout=3s"
+
+      # --- OpenAPI docs and metrics: restricted to an IP allowlist ---------
+      # Defaults to private ranges only, i.e. unreachable from the internet.
+      # Set ADMIN_ALLOWED_CIDRS to your office/VPN range to reach them.
+      - "traefik.http.middlewares.admin-allowlist.ipallowlist.sourcerange=${ADMIN_ALLOWED_CIDRS:-127.0.0.1/32,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}"
+      - "traefik.http.routers.backend-admin.rule=${BACKEND_ADMIN_ROUTE_RULE:-PathPrefix(`/docs`) || PathPrefix(`/redoc`) || PathPrefix(`/openapi.json`) || PathPrefix(`/metrics`)}"
+      - "traefik.http.routers.backend-admin.entrypoints=web"
+      - "traefik.http.routers.backend-admin.priority=200"
+      - "traefik.http.routers.backend-admin.middlewares=admin-allowlist,security-headers@file"
+      - "traefik.http.routers.backend-admin.service=backend"
+
+  ############################################################################
+  # Web UI. Catch-all route: anything not claimed by the API lands here.
+  ############################################################################
+  frontend:
+    image: ${DOCKERHUB_NAMESPACE:?DOCKERHUB_NAMESPACE is required}/${FRONTEND_IMAGE_NAME:-task-manager-frontend}:${IMAGE_TAG:-latest}
+    build:
+      context: ./frontend
+      args:
+        # Relative by default: the browser calls the same origin it loaded the
+        # page from, and Traefik forwards /api to the backend. No CORS, and the
+        # image is not tied to a hostname.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-/api}
+    <<: *default-restart
+    logging: *default-logging
+    environment:
+      NODE_ENV: production
+    networks:
+      - edge
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    stop_grace_period: 20s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=edge"
+      - "traefik.http.routers.frontend.rule=${FRONTEND_ROUTE_RULE:-PathPrefix(`/`)}"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.routers.frontend.middlewares=security-headers@file"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+      - "traefik.http.services.frontend.loadbalancer.healthcheck.path=/healthz"
+      - "traefik.http.services.frontend.loadbalancer.healthcheck.interval=10s"
+
+  ############################################################################
+  # Optional metrics collection: `docker compose --profile monitoring up -d`.
+  # Not exposed through Traefik; reach it over an SSH tunnel.
+  ############################################################################
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    profiles: ["monitoring"]
+    <<: *default-restart
+    logging: *default-logging
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--web.enable-lifecycle"
+    ports:
+      # Bound to loopback: reachable only through `ssh -L 9090:localhost:9090`.
+      - "127.0.0.1:9090:9090"
+    networks:
+      - edge
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "traefik.enable=false"
+
+networks:
+  # Router <-> application traffic.
+  edge:
+    name: edge
+  # Application <-> database traffic. `internal: true` removes the gateway, so
+  # these containers have no route to the internet at all.
+  internal:
+    name: internal
+    internal: true
+
+volumes:
+  postgres-data:
+  prometheus-data:

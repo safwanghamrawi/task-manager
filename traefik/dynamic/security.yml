@@ -1,0 +1,45 @@
+################################################################################
+# Traefik dynamic configuration: middlewares shared by every router.
+# Referenced from container labels as `<name>@file`.
+################################################################################
+
+http:
+  middlewares:
+    # Baseline response hardening. The frontend sets some of these itself; a
+    # header set here also covers the API and any future service.
+    security-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: strict-origin-when-cross-origin
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: false
+        # Only emitted over HTTPS; harmless on the plain-HTTP deployment.
+        forceSTSHeader: false
+        customResponseHeaders:
+          Server: ""
+          X-Powered-By: ""
+
+    # NOTE: the per-client rate limit lives in docker-compose.yml instead, so
+    # its thresholds can be tuned per environment — the file provider does not
+    # interpolate environment variables.
+
+    # Retry idempotent requests that fail because a backend replica went away
+    # mid-rollout. Traefik only retries when no response byte has been sent.
+    backend-retry:
+      retry:
+        attempts: 2
+        initialInterval: 100ms
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      sniStrict: false
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
