@@ -122,7 +122,22 @@ resource "aws_lb_target_group" "frontend" {
 # --- Listeners --------------------------------------------------------------
 
 locals {
-  tls_enabled = var.acm_certificate_arn != ""
+  # Decided from variables, never from a resource attribute: this drives
+  # `count` and `for_each` below, which Terraform must resolve during plan.
+  tls_enabled = var.acm_certificate_arn != "" || var.domain_name != ""
+
+  # The ARN the listener actually attaches. When Route 53 validation is
+  # managed here, take it from the validation resource rather than the
+  # certificate — that attribute only resolves once ACM reports ISSUED, which
+  # is what stops the listener being handed a PENDING_VALIDATION certificate.
+  # A conditional type-checks every branch, so an unguarded [0] fails whenever
+  # the count is zero. The splat plus one() yields null for an empty list
+  # instead of erroring.
+  certificate_arn = (
+    var.acm_certificate_arn != "" ? var.acm_certificate_arn :
+    local.manage_validation == 1 ? one(aws_acm_certificate_validation.main[*].certificate_arn) :
+    one(aws_acm_certificate.main[*].arn)
+  )
 
   # Rules attach to whichever listener actually serves the application.
   app_listener_arn = local.tls_enabled ? aws_lb_listener.https[0].arn : aws_lb_listener.http.arn
@@ -179,7 +194,7 @@ resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.main.arn
   port              = 443
   protocol          = "HTTPS"
-  certificate_arn   = var.acm_certificate_arn
+  certificate_arn   = local.certificate_arn
   # TLS 1.2 floor, matching the Traefik tls options this replaces.
   ssl_policy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
 

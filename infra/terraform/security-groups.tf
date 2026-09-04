@@ -30,7 +30,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
 }
 
 resource "aws_vpc_security_group_ingress_rule" "alb_https" {
-  count = var.acm_certificate_arn == "" ? 0 : 1
+  count = local.tls_enabled ? 1 : 0
 
   security_group_id = aws_security_group.alb.id
   description       = "HTTPS from anywhere"

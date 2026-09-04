@@ -6,7 +6,14 @@
 
 output "app_url" {
   description = "Public entry point. Feed this to scripts/smoke-test.sh."
-  value       = local.tls_enabled ? "https://${aws_lb.main.dns_name}" : "http://${aws_lb.main.dns_name}"
+  # Over HTTPS this MUST be the certificate's domain, not the load balancer's
+  # own hostname: the certificate is issued for domain_name, so a request to
+  # *.elb.amazonaws.com fails hostname verification before it is even served.
+  value = (
+    local.tls_enabled && var.domain_name != "" ? "https://${var.domain_name}" :
+    local.tls_enabled ? "https://${aws_lb.main.dns_name}" :
+    "http://${aws_lb.main.dns_name}"
+  )
 }
 
 output "alb_dns_name" {
@@ -79,6 +86,29 @@ output "database_endpoint" {
   value       = aws_db_instance.main.address
 }
 
+output "acm_certificate_arn" {
+  description = "The certificate the HTTPS listener uses. Empty when running plain HTTP."
+  value       = local.tls_enabled ? local.certificate_arn : ""
+}
+
+output "acm_validation_record" {
+  description = <<-DESC
+    The DNS record that proves domain ownership, for a zone Terraform does not
+    manage. Add it at your provider, then apply again. Empty when Route 53
+    handles it or when no certificate is being created.
+
+    ACM re-reads this record to auto-renew — leave it in place permanently.
+  DESC
+  value = local.create_certificate == 1 && local.manage_validation == 0 ? {
+    for dvo in flatten(aws_acm_certificate.main[*].domain_validation_options) :
+    dvo.domain_name => {
+      name  = dvo.resource_record_name
+      type  = dvo.resource_record_type
+      value = dvo.resource_record_value
+    }
+  } : {}
+}
+
 output "alb_arn" {
   description = "Load balancer ARN, for the elbv2 and wafv2 CLI calls in the runbook."
   value       = aws_lb.main.arn
@@ -124,7 +154,7 @@ output "deploy_env" {
     "export FRONTEND_SERVICE=${aws_ecs_service.frontend.name}",
     "export BACKEND_REPOSITORY=${aws_ecr_repository.this["backend"].repository_url}",
     "export FRONTEND_REPOSITORY=${aws_ecr_repository.this["frontend"].repository_url}",
-    "export APP_URL=${local.tls_enabled ? "https" : "http"}://${aws_lb.main.dns_name}",
+    "export APP_URL=${local.tls_enabled && var.domain_name != "" ? "https://${var.domain_name}" : local.tls_enabled ? "https://${aws_lb.main.dns_name}" : "http://${aws_lb.main.dns_name}"}",
     # Not needed to deploy; needed constantly by docs/RUNBOOK.md.
     "export ALB_ARN=${aws_lb.main.arn}",
     "export BACKEND_TARGET_GROUP=${aws_lb_target_group.backend.arn}",

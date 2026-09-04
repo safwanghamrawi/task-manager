@@ -310,6 +310,36 @@ variable "admin_allowed_cidrs" {
   default     = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 }
 
+variable "domain_name" {
+  description = <<-DESC
+    Hostname the application is served on, e.g. "task-manager.example.com".
+    Setting it makes Terraform request an ACM certificate and enables the HTTPS
+    listener; port 80 becomes a 301 redirect.
+
+    Leave empty for plain HTTP on the load balancer's own hostname — a
+    certificate cannot be issued for *.elb.amazonaws.com, because that is
+    Amazon's domain and cannot be validated.
+
+    Ignored when acm_certificate_arn is set.
+  DESC
+  type        = string
+  default     = ""
+}
+
+variable "route53_zone_id" {
+  description = <<-DESC
+    Hosted zone for domain_name, when the zone is in this account's Route 53.
+    Set it and Terraform writes the DNS validation record itself, so the
+    certificate is issued within a single apply.
+
+    Leave empty when DNS is hosted elsewhere. Terraform still requests the
+    certificate; the record to add is published as the `acm_validation_record`
+    output, and a second apply picks up the issued certificate.
+  DESC
+  type        = string
+  default     = ""
+}
+
 variable "acm_certificate_arn" {
   description = <<-DESC
     ACM certificate for HTTPS. When set, the ALB gets a 443 listener and port

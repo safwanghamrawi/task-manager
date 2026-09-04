@@ -119,6 +119,49 @@ Then create a `production` environment there and attach whatever reviewers you
 want; the role's trust policy names it, so its protection rules run before AWS
 is contacted.
 
+## Enabling HTTPS
+
+Set `domain_name` and Terraform requests an ACM certificate, adds a 443
+listener, opens 443 on the load balancer's security group, moves every listener
+rule onto it and turns port 80 into a 301 redirect.
+
+**If the zone is in this account's Route 53**, also set `route53_zone_id`.
+Terraform writes the validation record and one apply is enough.
+
+**If DNS is hosted elsewhere**, Terraform cannot write the validation record,
+so it takes two applies — the certificate has to be ISSUED before an ALB will
+attach it:
+
+```bash
+# 1. Create the certificate only
+terraform apply -var domain_name=app.example.com \
+  -target=aws_acm_certificate.main
+
+# 2. Add the record it asks for, at your DNS provider
+terraform output acm_validation_record
+
+# 3. Once ACM reports ISSUED, apply the rest
+aws acm wait certificate-validated --certificate-arn "$(terraform output -raw acm_certificate_arn)"
+terraform apply
+```
+
+Leave the validation record in place permanently — ACM re-reads it to renew.
+
+Point the hostname itself at the load balancer with a **CNAME** to
+`terraform output -raw alb_dns_name`; never an A record, because the load
+balancer's addresses change.
+
+Two things that follow:
+
+- **`app_url` becomes `https://<domain_name>`**, not the load balancer's own
+  hostname. It has to: the certificate is issued for your domain, so a request
+  to `*.elb.amazonaws.com` fails hostname verification. Update the `APP_URL`
+  repository variable to match, or the pipeline's smoke test will hit a 301 and
+  fail every deployment.
+- **The listener rules are recreated**, because a rule's `listener_arn` cannot
+  be changed in place. Nothing else is touched — not the load balancer, the
+  target groups, the services or the database.
+
 ## Tearing down
 
 ```bash
