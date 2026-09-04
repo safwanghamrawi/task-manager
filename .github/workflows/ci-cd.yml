@@ -1,0 +1,514 @@
+name: CI/CD
+
+# Pull requests get the full quality gate; only a push to main can publish an
+# image or touch the cluster.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: "Build and push images without deploying"
+        type: boolean
+        default: false
+
+# The default token is read-only; every job that needs more asks for it.
+# id-token is what lets a job mint the OIDC assertion AWS trades for
+# credentials — see infra/terraform/iam-github.tf.
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the previous run — except on main,
+# where a half-finished deployment must never be interrupted.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-west-1' }}
+  # Repository names as created by infra/terraform/ecr.tf, which builds them
+  # from var.project. Override these if you changed it.
+  BACKEND_REPOSITORY_NAME: ${{ vars.BACKEND_REPOSITORY_NAME || 'task-manager/backend' }}
+  FRONTEND_REPOSITORY_NAME: ${{ vars.FRONTEND_REPOSITORY_NAME || 'task-manager/frontend' }}
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Static analysis. Fast, no services, runs on every push and PR.
+  # ---------------------------------------------------------------------------
+  lint-backend:
+    name: Lint backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        working-directory: backend
+        run: ruff check --output-format=github .
+
+      - name: Ruff (format)
+        working-directory: backend
+        run: ruff format --check .
+
+      - name: mypy (strict)
+        working-directory: backend
+        run: mypy app
+
+  lint-frontend:
+    name: Lint frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: ESLint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: TypeScript
+        working-directory: frontend
+        run: npm run typecheck
+
+  lint-infra:
+    name: Lint infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Format
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive -diff
+
+      # No credentials and no backend: this validates the configuration, it
+      # does not read or write state.
+      - name: Validate
+        working-directory: infra/terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - name: Shellcheck the deployment scripts
+        run: shellcheck scripts/*.sh
+
+  # ---------------------------------------------------------------------------
+  # 3. Tests against a real PostgreSQL, not the SQLite the suite defaults to.
+  #    A driver-level difference must fail here, not in production.
+  # ---------------------------------------------------------------------------
+  test-backend:
+    name: Test backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: taskmanager
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: tasks_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U taskmanager -d tasks_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://taskmanager:test-password@localhost:5432/tasks_test
+      TEST_DATABASE_URL: postgresql+asyncpg://taskmanager:test-password@localhost:5432/tasks_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest
+        working-directory: backend
+        run: pytest -v
+
+  # ---------------------------------------------------------------------------
+  # 4. Build both images once and push them to ECR. Only on main: a PR proves
+  #    the images build without publishing anything.
+  #
+  #    Images go to a private ECR registry, authenticated over OIDC, so this
+  #    job holds no secret at all. `id-token: write` is what lets it ask GitHub
+  #    for an assertion, and the trust policy on the role decides whether AWS
+  #    accepts it.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint-backend, lint-frontend, lint-infra, test-backend]
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      backend_image: ${{ steps.meta.outputs.backend_image }}
+      frontend_image: ${{ steps.meta.outputs.frontend_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # `configure-aws-credentials` reports both an empty role and an unknown
+      # one as an opaque credentials error, and STS answers a malformed ARN
+      # with the same "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+      # it uses for a trust-policy mismatch. Neither is distinguishable after
+      # the fact, so both are checked here first.
+      - name: Check the deployment role is configured
+        if: github.event_name != 'pull_request'
+        env:
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "${AWS_DEPLOY_ROLE_ARN}" ]; then
+            echo "::error title=AWS_DEPLOY_ROLE_ARN is not set::\
+          Set it under Settings -> Secrets and variables -> Actions -> Variables (the \
+          VARIABLES tab, not Secrets - this workflow reads vars.*), at REPOSITORY scope. \
+          A variable scoped to the production ENVIRONMENT is invisible here: this job \
+          declares no environment, deliberately, so a deployment approval rule cannot \
+          gate image builds. Get the value with: make tf-ci-vars"
+            exit 1
+          fi
+
+          # Catch a value that was pasted with the quotes `terraform output` prints
+          # without -raw, or with stray whitespace. STS answers a malformed or unknown
+          # role ARN with "Not authorized to perform sts:AssumeRoleWithWebIdentity" -
+          # the same message a trust-policy mismatch gives - so distinguishing them
+          # after the fact is guesswork. Do it before the call instead.
+          valid=yes
+          case "${AWS_DEPLOY_ROLE_ARN}" in
+            # An ARN never contains whitespace, and a pasted value very often does.
+            *[[:space:]]*) valid=no ;;
+            arn:aws:iam::[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]:role/*) ;;
+            *) valid=no ;;
+          esac
+          if [ "${valid}" = no ]; then
+            echo "::error title=AWS_DEPLOY_ROLE_ARN is malformed::\
+          Got [${AWS_DEPLOY_ROLE_ARN}] - shown in brackets so surrounding quotes or \
+          spaces are visible. Expected arn:aws:iam::<12-digit-account>:role/<name> with \
+          no whitespace. A common cause is copying 'terraform output \
+          github_deploy_role_arn', which prints the value in double quotes; use \
+          'terraform output -raw' or 'make tf-ci-vars'."
+            exit 1
+          fi
+
+          # Print the identity GitHub is actually asserting, so a trust-policy mismatch
+          # is readable instead of inferred. Only the sub/aud/repository claims are
+          # echoed - never the token itself.
+          claims=""
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            jwt="$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" | jq -r .value)"
+            body="$(printf '%s' "${jwt}" | cut -d. -f2 | tr '_-' '/+')"
+            case $(( ${#body} % 4 )) in 2) body="${body}==" ;; 3) body="${body}=" ;; esac
+            claims="$(printf '%s' "${body}" | base64 -d 2>/dev/null \
+              | jq -r '"  sub: \(.sub)\n  aud: \(.aud)"' 2>/dev/null)"
+          fi
+
+          echo "Assuming ${AWS_DEPLOY_ROLE_ARN}"
+          if [ -n "${claims}" ]; then
+            echo "OIDC identity being presented:"
+            echo "${claims}"
+            echo "This sub must match one of the values in the role's trust policy"
+            echo "(infra/terraform/iam-github.tf)."
+          fi
+
+      - name: Assume the deployment role
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-build-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          # The commit SHA is the deployable identity: `latest` is a
+          # convenience, never what a service is pinned to.
+          tag="sha-${GITHUB_SHA::7}"
+          # On a pull request there is no registry to name, so a local prefix
+          # keeps the build steps below identical either way.
+          registry="${{ steps.ecr.outputs.registry || 'local' }}"
+
+          {
+            echo "image_tag=${tag}"
+            echo "registry=${registry}"
+            echo "backend_image=${registry}/${BACKEND_REPOSITORY_NAME}"
+            echo "frontend_image=${registry}/${FRONTEND_REPOSITORY_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The backend test stage runs the suite inside the image, so what ships
+      # is exactly what was verified.
+      - name: Backend - verify inside the image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: test
+          push: false
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Backend - build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          target: runtime
+          # Matches runtime_platform.cpu_architecture in infra/terraform/ecs.tf.
+          # A mismatch here does not fail the build; it fails every task, at
+          # deploy time, with an exec-format error.
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.backend_image }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+          provenance: false
+
+      - name: Frontend - build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          target: runner
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          build-args: |
+            NEXT_PUBLIC_API_BASE_URL=/api
+          tags: |
+            ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.frontend_image }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+          provenance: false
+
+  # ---------------------------------------------------------------------------
+  # 5. Vulnerability scan of the published images. Reported always, blocking
+  #    only on CRITICAL findings that actually have a fix available.
+  #
+  #    ECR also scans on push (see ecr.tf). This gate is what stops a release;
+  #    that one catches a CVE published after the image already shipped.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Scan images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      # Required for all SARIF uploads.
+      security-events: write
+      # Required only in a PRIVATE repository: upload-sarif reads the workflow
+      # run through the Actions API to attach the results to it. Without this
+      # the upload fails with "Resource not accessible by integration", which
+      # names the API call but not the missing permission.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            image: ${{ needs.build.outputs.backend_image }}
+          - name: frontend
+            image: ${{ needs.build.outputs.frontend_image }}
+    steps:
+      # Trivy pulls the image, so it needs to be able to authenticate to ECR.
+      - name: Assume the deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-scan-${{ matrix.name }}-${{ github.run_id }}
+
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}:${{ needs.build.outputs.image_tag }}
+          format: sarif
+          output: trivy-${{ matrix.name }}.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      # Code scanning needs a GitHub Code Security licence on a PRIVATE
+      # repository; it is free on public ones. Skipped rather than failed when
+      # it is unavailable, because this upload is reporting, not enforcement —
+      # the release gate is the unconditional Trivy step below. Set the
+      # ENABLE_CODE_SCANNING_UPLOAD repository variable to "true" once a
+      # licence is in place, or make the repository public.
+      - name: Upload results to code scanning
+        if: ${{ !github.event.repository.private || vars.ENABLE_CODE_SCANNING_UPLOAD == 'true' }}
+        # A lapsed or misconfigured licence must not break a deployment.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-${{ matrix.name }}.sarif
+          category: trivy-${{ matrix.name }}
+
+      # Keep the report regardless, so a finding is reviewable with no licence
+      # at all: the run's Artifacts section holds the full SARIF.
+      - name: Keep the scan report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ matrix.name }}
+          path: trivy-${{ matrix.name }}.sarif
+          retention-days: 30
+
+      - name: Fail on fixable CRITICAL findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}:${{ needs.build.outputs.image_tag }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ---------------------------------------------------------------------------
+  # 6. Deploy to ECS, then verify. A failed verification fails the workflow,
+  #    so a broken release is visible immediately.
+  #
+  #    Nothing here touches a server. It registers a task definition revision
+  #    and asks ECS to roll it out; the scheduler does the rest, behind a load
+  #    balancer that keeps the running tasks serving until the new ones pass
+  #    their health checks.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build, scan]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      !inputs.skip_deploy
+    permissions:
+      contents: read
+      id-token: write
+    # Attach required reviewers or a deployment window to this environment in
+    # repository settings. The role's trust policy also names it, so the
+    # environment's protection rules run before AWS is ever contacted.
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      BACKEND_SERVICE: ${{ vars.BACKEND_SERVICE }}
+      FRONTEND_SERVICE: ${{ vars.FRONTEND_SERVICE }}
+      BACKEND_REPOSITORY: ${{ needs.build.outputs.backend_image }}
+      FRONTEND_REPOSITORY: ${{ needs.build.outputs.frontend_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the deployment variables are configured
+        env:
+          # ECS_CLUSTER and the service names come from the job env above;
+          # these two do not, so they are named here.
+          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          missing=""
+          for name in AWS_DEPLOY_ROLE_ARN ECS_CLUSTER BACKEND_SERVICE FRONTEND_SERVICE APP_URL; do
+            [ -n "${!name}" ] || missing="${missing} ${name}"
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error title=Missing repository variables::\
+          Not set:${missing}. Add them at REPOSITORY scope under Settings -> \
+          Secrets and variables -> Actions -> Variables. Values come from: \
+          make tf-ci-vars"
+            exit 1
+          fi
+
+      - name: Assume the deployment role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+
+      - name: Deploy
+        run: ./scripts/ecs-deploy.sh
+
+      # Runs from the runner, against the public URL. /metrics is restricted by
+      # an ALB listener rule the runner's address does not match, so the smoke
+      # test's 403 assertion holds from here.
+      - name: Verify the deployment
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: ./scripts/smoke-test.sh "${APP_URL}"
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          echo "::error::Deployment failed - rolling back to the previous task definition"
+          ./scripts/ecs-rollback.sh
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Deployment"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Tag | \`${IMAGE_TAG}\` |"
+            echo "| Cluster | \`${ECS_CLUSTER}\` |"
+            echo "| URL | ${{ vars.APP_URL }} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

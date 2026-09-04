@@ -34,6 +34,9 @@ crash.log
 *.auto.tfvars
 terraform.tfvars
 
+# Deployment bookkeeping written by scripts/ecs-deploy.sh
+.ecs-deploy-previous
+
 # Local tooling
 .DS_Store
 .idea/
