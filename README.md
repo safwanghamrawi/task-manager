@@ -10,9 +10,9 @@ engineering around it is the point.
 - [What you get](#what-you-get)
 - [Everyday commands](#everyday-commands)
 - [Verify it works](#verify-it-works)
+- [Load testing](#load-testing)
 - [Working on the code](#working-on-the-code)
 - [Troubleshooting](#troubleshooting)
-- [Where to go next](#where-to-go-next)
 
 ---
 
@@ -91,7 +91,7 @@ involved, locally or in production.
 
 ## Everyday commands
 
-`make help` lists all 28 targets. The ones you will actually use:
+`make help` lists all 27 targets. The ones you will actually use:
 
 ```bash
 make up          # start everything, with hot reload
@@ -128,6 +128,88 @@ One check may print `WARN` rather than `PASS`: the `/metrics` endpoint is
 restricted to an IP allowlist that includes Docker's own network, so a request
 from inside the compose network legitimately succeeds where a public one would
 get a 403. That is expected locally.
+
+---
+
+## Load testing
+
+```bash
+./scripts/run-loadtest.sh
+```
+
+Runs [`loadtest/k6-load-test.js`](loadtest/k6-load-test.js) in the official
+`grafana/k6` container, so **k6 does not need to be installed**. The container
+joins the compose `edge` network and addresses Traefik by service name, so
+traffic takes the same path a real client's would — through the edge, not
+straight at the backend.
+
+The stack has to be running first (`make up`).
+
+### What it runs
+
+Two scenarios, in order:
+
+1. **Smoke** — 1 VU, one full CRUD cycle. It runs first and aborts the whole
+   run if it fails, so a broken deployment is reported as broken rather than as
+   a latency regression.
+2. **Load** — ramps to 100 VUs over 10s, holds 30s, ramps down over 5s. Each
+   iteration lists tasks, sometimes creates and deletes one, and sleeps
+   0.1–0.3s between iterations to behave like a client rather than a tight
+   loop.
+
+### Thresholds are the pass/fail contract
+
+A breached threshold exits non-zero, so this can gate a release:
+
+| Threshold | Meaning |
+|---|---|
+| `http_req_failed: rate<0.01` | under 1% transport-level failures |
+| `business_errors: rate<0.01` | under 1% unexpected status codes |
+| `http_req_duration: p(95)<500, p(99)<1000` | overall latency, ms |
+| `task_list_duration: p(95)<400` | the read path |
+| `task_create_duration: p(95)<600` | the write path |
+| `checks: rate>0.99` | assertions that passed |
+
+Alongside k6's built-ins it records `task_list_duration`,
+`task_create_duration`, `task_delete_duration`, `business_errors`,
+`tasks_created` and `tasks_deleted`, so a slow read is distinguishable from a
+slow write.
+
+### Tuning it
+
+All three are environment variables:
+
+```bash
+VUS=200 DURATION=60s ./scripts/run-loadtest.sh     # heavier
+BASE_URL=http://localhost:8080 ./scripts/run-loadtest.sh
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `VUS` | `100` | Virtual users at the plateau |
+| `DURATION` | `30s` | Length of the plateau, excluding ramps |
+| `BASE_URL` | `http://traefik` | A `//traefik` or `//backend` URL joins the compose network; anything else is treated as external and does not |
+| `NETWORK` | `edge` | The compose network to join |
+
+### Results
+
+Every run writes two timestamped files to `loadtest/results/`:
+
+```
+run-20260903T211928Z.log        the full console output
+summary-20260903T211928Z.json   machine-readable summary
+```
+
+### Against the deployed stack
+
+```bash
+BASE_URL="$(terraform -chdir=infra/terraform output -raw app_url)" \
+  ./scripts/run-loadtest.sh
+```
+
+Raise `waf_rate_limit` first. A load test from a single address deliberately
+sends far more than one client's fair share, so WAF will do exactly what it is
+there for and you will measure the rate limiter instead of the application.
 
 ---
 

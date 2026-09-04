@@ -37,6 +37,10 @@ terraform.tfvars
 # Deployment bookkeeping written by scripts/ecs-deploy.sh
 .ecs-deploy-previous
 
+# Load testing output
+loadtest/results/*
+!loadtest/results/.gitkeep
+
 # Local tooling
 .DS_Store
 .idea/
